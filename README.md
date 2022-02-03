@@ -9,19 +9,19 @@ import (
 )
 
 func main() {
-    config := NewSmtpConfig()
+  config := NewSmtpConfig()
 
-    sender := rmailer.NewSender(config.UserName, config.Password, config.ServerName, config.TLS)
+  sender := rmailer.NewSender(config.UserName, config.Password, config.ServerName, config.TLS)
 
-    m := rmailer.NewMessage(config.subject(), config.content())
+  m := rmailer.NewMessage(config.subject(), config.content())
 
-    m.To = config.to()
-	m.CC = config.cc()
-	m.BCC = config.bss()
+  m.To = config.to()
+  m.CC = config.cc()
+  m.BCC = config.bss()
 
-	m.AttachFile("/tmp/file_1.txt")
-    m.AttachFile("/tmp/file_2.txt")
+  m.AttachFile("/tmp/file_1.txt")
+  m.AttachFile("/tmp/file_2.txt")
 
-	sender.Send(m)
+  sender.Send(m)
 }
 ```
