@@ -5,7 +5,7 @@ library in go to send mails with attachments via smtp protocol
 package main
 
 import (
-  log "github.com/RaoH37/rmailer"
+  rmailer "github.com/RaoH37/rmailer"
 )
 
 func main() {
