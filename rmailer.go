@@ -5,27 +5,32 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
-	"log"
+	"io"
 	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
 	"net/mail"
 	"net/smtp"
+	"os"
 	"path/filepath"
 	"strings"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type Sender struct {
-	UserName   string
-	Password   string
-	ServerName string
-	TLS        bool
+	UserName string
+	Password string
+	Host     string
 }
 
-func NewSender(u string, p string, s string, t bool) *Sender {
-	return &Sender{UserName: u, Password: p, ServerName: s, TLS: t}
+func NewSender(u string, p string, s string) *Sender {
+	return &Sender{
+		UserName: u,
+		Password: p,
+		Host:     s,
+	}
 }
 
 func (s *Sender) IsAuthenticated() bool {
@@ -41,100 +46,124 @@ func (s *Sender) Send(m *Message) error {
 }
 
 func (s *Sender) AnonymousSend(m *Message) error {
-	// fmt.Println(fmt.Sprintf("SMTP ANONYMOUS vers le serveur %s\n", s.ServerName))
+	log.Info(fmt.Sprintf("SMTP connection to %s with username %s", s.Host, s.UserName))
 
-	c, err := smtp.Dial(s.ServerName)
+	c, err := smtp.Dial(s.Host)
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
+	defer c.Close()
 
-	// To && From
 	if err = c.Mail(s.UserName); err != nil {
-		log.Panic(err)
+		return err
 	}
+	defer c.Close()
 
-	for _, to := range m.To {
-		if err = c.Rcpt(to.Address); err != nil {
-			log.Panic(err)
-		}
-	}
+	recipients(c, m)
 
 	// Data
 	w, err := c.Data()
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
+	defer c.Close()
 
 	_, err = w.Write(m.ToBytes())
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
+	defer c.Close()
 
 	err = w.Close()
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
+	defer c.Close()
 
 	return c.Quit()
 }
 
 func (s *Sender) AuthenticatedSend(m *Message) error {
-	fmt.Println(fmt.Sprintf("SMTP AUTH vers le serveur %s\n", s.ServerName))
-	host, _, _ := net.SplitHostPort(s.ServerName)
+	log.Info(fmt.Sprintf("SMTP AUTH connection to %s", s.Host))
+
+	host, _, _ := net.SplitHostPort(s.Host)
 
 	auth := smtp.PlainAuth("", s.UserName, s.Password, host)
 
 	tlsconfig := &tls.Config{
-		InsecureSkipVerify: s.TLS,
+		InsecureSkipVerify: true,
 		ServerName:         host,
 	}
 
-	conn, err := tls.Dial("tcp", s.ServerName, tlsconfig)
+	conn, err := tls.Dial("tcp", s.Host, tlsconfig)
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
+	defer conn.Close()
 
 	c, err := smtp.NewClient(conn, host)
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
+	defer c.Close()
 
 	// Auth
 	if err = c.Auth(auth); err != nil {
-		log.Panic(err)
+		return err
 	}
+	defer c.Close()
 
-	// To && From
 	if err = c.Mail(s.UserName); err != nil {
-		log.Panic(err)
+		return err
 	}
+	defer c.Close()
 
-	for _, to := range m.To {
-		if err = c.Rcpt(to.Address); err != nil {
-			log.Panic(err)
-		}
-	}
+	recipients(c, m)
 
 	// Data
 	w, err := c.Data()
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
+	defer c.Close()
 
 	_, err = w.Write(m.ToBytes())
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
+	defer c.Close()
 
 	err = w.Close()
 	if err != nil {
-		log.Panic(err)
+		return err
 	}
+	defer c.Close()
 
 	return c.Quit()
 }
 
+func recipients(c *smtp.Client, m *Message) {
+	for _, r := range m.To {
+		if err := c.Rcpt(r.Address); err != nil {
+			log.Println(err)
+		}
+	}
+
+	for _, r := range m.CC {
+		if err := c.Rcpt(r.Address); err != nil {
+			log.Println(err)
+		}
+	}
+
+	for _, r := range m.BCC {
+		if err := c.Rcpt(r.Address); err != nil {
+			log.Println(err)
+		}
+	}
+}
+
 type Message struct {
+	From        mail.Address
 	To          []mail.Address
 	CC          []mail.Address
 	BCC         []mail.Address
@@ -143,17 +172,52 @@ type Message struct {
 	Attachments map[string][]byte
 }
 
-func NewMessage(s, b string) *Message {
-	return &Message{Subject: s, Body: b, Attachments: make(map[string][]byte)}
+func (m *Message) SetFromFromString(s string) {
+	m.From = mail.Address{Address: s}
 }
 
-func (m *Message) AttachFile(src string) error {
-	b, err := ioutil.ReadFile(src)
+func (m *Message) SetToFromStrings(ss []string) {
+	m.To = make([]mail.Address, len(ss))
+
+	for i, r := range ss {
+		m.To[i] = mail.Address{Address: r}
+	}
+}
+
+func (m *Message) SetCcFromStrings(ss []string) {
+	m.CC = make([]mail.Address, len(ss))
+
+	for i, r := range ss {
+		m.CC[i] = mail.Address{Address: r}
+	}
+}
+
+func (m *Message) SetBccFromStrings(ss []string) {
+	m.BCC = make([]mail.Address, len(ss))
+
+	for i, r := range ss {
+		m.BCC[i] = mail.Address{Address: r}
+	}
+}
+
+func NewMessage(subject, content string) *Message {
+	return &Message{Subject: subject, Body: content, Attachments: make(map[string][]byte)}
+}
+
+func (m *Message) AttachFile(path string) error {
+	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 
-	_, fileName := filepath.Split(src)
+	b, err := io.ReadAll(file)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, fileName := filepath.Split(path)
 	m.Attachments[fileName] = b
 	return nil
 }
@@ -161,20 +225,18 @@ func (m *Message) AttachFile(src string) error {
 func (m *Message) ToBytes() []byte {
 	buf := bytes.NewBuffer(nil)
 	withAttachments := len(m.Attachments) > 0
-	var coder = base64.StdEncoding
-	var subject = "=?UTF-8?B?" + coder.EncodeToString([]byte(m.Subject)) + "?="
-	buf.WriteString("Subject: " + subject + "\r\n")
 
-	// buf.WriteString(fmt.Sprintf("Subject: %s\n", m.Subject))
+	buf.WriteString(fmt.Sprintf("From: %s\r\n", m.From.String()))
+
 	buf.WriteString(fmt.Sprintf("To: %s\r\n", get_recipients_str(m.To)))
 
 	if len(m.CC) > 0 {
 		buf.WriteString(fmt.Sprintf("Cc: %s\r\n", get_recipients_str(m.CC)))
 	}
 
-	if len(m.BCC) > 0 {
-		buf.WriteString(fmt.Sprintf("Bcc: %s\r\n", get_recipients_str(m.BCC)))
-	}
+	var coder = base64.StdEncoding
+	var subject = "=?UTF-8?B?" + coder.EncodeToString([]byte(m.Subject)) + "?="
+	buf.WriteString("Subject: " + subject + "\r\n")
 
 	buf.WriteString("MIME-Version: 1.0\n")
 	writer := multipart.NewWriter(buf)
