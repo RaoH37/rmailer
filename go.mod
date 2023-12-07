@@ -1,4 +1,4 @@
-module rmailer
+module github.com/RaoH37/rmailer
 
 go 1.20
 
