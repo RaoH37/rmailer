@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"mime/multipart"
 	"net"
@@ -15,8 +16,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+)
 
-	log "github.com/sirupsen/logrus"
+const (
+	ContentTypeMultipartMixed          = "multipart/mixed"
+	ContentTypeMultipartAlternative    = "multipart/alternative"
+	ContentTypeTextHtml                = "text/html"
+	ContentTypeTextPlain               = "text/plain"
+	ContentTypeLine                    = "Content-Type: %s\n"
+	ContentTypeLineBoundary            = "Content-Type: %s; boundary=%s\n\n--%s\n"
+	ContentTransfertEncodingBase64Line = "Content-Transfer-Encoding: base64\n"
+	MimeVersionLine                    = "MIME-Version: 1.0\n"
+	BoundaryLine                       = "\n\n--%s\n"
+	ContentDispositionAttachmentLine   = "Content-Disposition: attachment; filename=\"=?UTF-8?B?%s?=\"\r\n\r\n"
+	BackLine                           = "\r\n"
 )
 
 type Sender struct {
@@ -25,11 +38,11 @@ type Sender struct {
 	Host     string
 }
 
-func NewSender(u string, p string, s string) *Sender {
+func NewSender(username string, password string, host string) *Sender {
 	return &Sender{
-		UserName: u,
-		Password: p,
-		Host:     s,
+		UserName: username,
+		Password: password,
+		Host:     host,
 	}
 }
 
@@ -46,7 +59,7 @@ func (s *Sender) Send(m *Message) error {
 }
 
 func (s *Sender) AnonymousSend(m *Message) error {
-	log.Info(fmt.Sprintf("SMTP connection to %s with username %s", s.Host, s.UserName))
+	log.Println(fmt.Sprintf("SMTP connection to %s with username %s", s.Host, s.UserName))
 
 	c, err := smtp.Dial(s.Host)
 	if err != nil {
@@ -84,7 +97,7 @@ func (s *Sender) AnonymousSend(m *Message) error {
 }
 
 func (s *Sender) AuthenticatedSend(m *Message) error {
-	log.Info(fmt.Sprintf("SMTP AUTH connection to %s", s.Host))
+	log.Println(fmt.Sprintf("SMTP AUTH connection to %s", s.Host))
 
 	host, _, _ := net.SplitHostPort(s.Host)
 
@@ -168,7 +181,8 @@ type Message struct {
 	CC          []mail.Address
 	BCC         []mail.Address
 	Subject     string
-	Body        string
+	BodyText    string
+	BodyHtml    string
 	Attachments map[string][]byte
 }
 
@@ -200,8 +214,13 @@ func (m *Message) SetBccFromStrings(ss []string) {
 	}
 }
 
-func NewMessage(subject, content string) *Message {
-	return &Message{Subject: subject, Body: content, Attachments: make(map[string][]byte)}
+func NewMessage(subject, text string, html string) *Message {
+	return &Message{
+		Subject:     subject,
+		BodyText:    text,
+		BodyHtml:    html,
+		Attachments: make(map[string][]byte),
+	}
 }
 
 func (m *Message) AttachFile(path string) error {
@@ -223,47 +242,55 @@ func (m *Message) AttachFile(path string) error {
 }
 
 func (m *Message) ToBytes() []byte {
-	buf := bytes.NewBuffer(nil)
+	var coder = base64.StdEncoding
+
+	mb := &MessageBuilder{Message: m, Coder: coder}
 	withAttachments := len(m.Attachments) > 0
+	bothBody := len(m.BodyHtml) > 0 && len(m.BodyText) > 0
 
-	buf.WriteString(fmt.Sprintf("From: %s\r\n", m.From.String()))
-
-	buf.WriteString(fmt.Sprintf("To: %s\r\n", get_recipients_str(m.To)))
+	buf := bytes.NewBuffer(nil)
+	buf.WriteString(mb.FromLine())
+	buf.WriteString(mb.ToLine())
 
 	if len(m.CC) > 0 {
-		buf.WriteString(fmt.Sprintf("Cc: %s\r\n", get_recipients_str(m.CC)))
+		buf.WriteString(mb.CcLine())
 	}
 
-	var coder = base64.StdEncoding
-	var subject = "=?UTF-8?B?" + coder.EncodeToString([]byte(m.Subject)) + "?="
-	buf.WriteString("Subject: " + subject + "\r\n")
+	buf.WriteString(mb.SubjectLine())
 
-	buf.WriteString("MIME-Version: 1.0\n")
+	buf.WriteString(MimeVersionLine)
+
 	writer := multipart.NewWriter(buf)
-	boundary := writer.Boundary()
+	boundaryMixed := writer.Boundary()
+	boundaryAlternative := writer.Boundary()
+
 	if withAttachments {
-		buf.WriteString(fmt.Sprintf("Content-Type: multipart/mixed; boundary=%s\n", boundary))
-		buf.WriteString(fmt.Sprintf("--%s\n", boundary))
-	} else {
-		buf.WriteString("Content-Type: text/plain; charset=utf-8\n")
+		buf.WriteString(fmt.Sprintf(ContentTypeLineBoundary, ContentTypeMultipartMixed, boundaryMixed, boundaryMixed))
 	}
 
-	buf.WriteString(fmt.Sprintf("Content-Type: %s; charset=utf-8\r\n\r\n", "text/plain"))
-	buf.WriteString(m.Body)
-	buf.WriteString("\r\n")
+	if bothBody {
+		buf.WriteString(fmt.Sprintf(ContentTypeLineBoundary, ContentTypeMultipartAlternative, boundaryAlternative, boundaryAlternative))
+	}
+
+	if len(m.BodyHtml) > 0 {
+		buf.WriteString(mb.BodyHtmlLine())
+
+		if len(m.BodyText) > 0 {
+			buf.WriteString(fmt.Sprintf(BoundaryLine, boundaryAlternative))
+		}
+	}
+
+	if len(m.BodyText) > 0 {
+		buf.WriteString(mb.BodyTextLine())
+	}
 
 	if withAttachments {
 		for k, v := range m.Attachments {
-			buf.WriteString(fmt.Sprintf("\n\n--%s\n", boundary))
+			buf.WriteString(fmt.Sprintf(BoundaryLine, boundaryMixed))
 
-			contentType := getContentType(k, v)
-
-			buf.WriteString(fmt.Sprintf("Content-Type: %s\n", contentType))
-			buf.WriteString("Content-Transfer-Encoding: base64\n")
-
-			buf.WriteString("Content-Disposition: attachment; filename=\"=?UTF-8?B?")
-			buf.WriteString(coder.EncodeToString([]byte(k)))
-			buf.WriteString("?=\"\r\n\r\n")
+			buf.WriteString(fmt.Sprintf(ContentTypeLine, getContentType(k, v)))
+			buf.WriteString(ContentTransfertEncodingBase64Line)
+			buf.WriteString(fmt.Sprintf(ContentDispositionAttachmentLine, coder.EncodeToString([]byte(k))))
 
 			b := make([]byte, base64.StdEncoding.EncodedLen(len(v)))
 			base64.StdEncoding.Encode(b, v)
@@ -272,11 +299,11 @@ func (m *Message) ToBytes() []byte {
 			for i, l := 0, len(b); i < l; i++ {
 				buf.WriteByte(b[i])
 				if (i+1)%76 == 0 {
-					buf.WriteString("\r\n")
+					buf.WriteString(BackLine)
 				}
 			}
-			buf.WriteString(fmt.Sprintf("\n--%s", boundary))
 
+			buf.WriteString(fmt.Sprintf(BoundaryLine, boundaryMixed))
 		}
 
 		buf.WriteString("--")
@@ -285,9 +312,43 @@ func (m *Message) ToBytes() []byte {
 	return buf.Bytes()
 }
 
+type MessageBuilder struct {
+	Message *Message
+	Coder   *base64.Encoding
+}
+
+func (mb *MessageBuilder) FromLine() string {
+	return fmt.Sprintf("From: %s\r\n", mb.Message.From.String())
+}
+
+func (mb *MessageBuilder) ToLine() string {
+	return fmt.Sprintf("To: %s\r\n", getRecipientsStr(mb.Message.To))
+}
+
+func (mb *MessageBuilder) CcLine() string {
+	return fmt.Sprintf("Cc: %s\r\n", getRecipientsStr(mb.Message.CC))
+}
+
+func (mb *MessageBuilder) SubjectLine() string {
+	var subjectUtf8 = mb.Coder.EncodeToString([]byte(mb.Message.Subject))
+	return fmt.Sprintf("Subject: =?UTF-8?B?%s?=\r\n", subjectUtf8)
+}
+
+func (mb *MessageBuilder) BodyLine(content string, contentType string) string {
+	return fmt.Sprintf("Content-Type: %s; charset=utf-8\r\n\r\n%s\r\n", contentType, content)
+}
+
+func (mb *MessageBuilder) BodyHtmlLine() string {
+	return mb.BodyLine(mb.Message.BodyHtml, ContentTypeTextHtml)
+}
+
+func (mb *MessageBuilder) BodyTextLine() string {
+	return mb.BodyLine(mb.Message.BodyText, ContentTypeTextPlain)
+}
+
 func getContentType(name string, content []byte) string {
 	contentType := http.DetectContentType(content)
-	if strings.HasPrefix(contentType, "text/plain") {
+	if strings.HasPrefix(contentType, ContentTypeTextPlain) {
 		ext := filepath.Ext(name)
 		contentType = mime.TypeByExtension(ext)
 	}
@@ -295,12 +356,12 @@ func getContentType(name string, content []byte) string {
 	return contentType
 }
 
-func get_recipients_str(recipients []mail.Address) string {
-	recipients_str := []string{}
+func getRecipientsStr(recipients []mail.Address) string {
+	var recipientsStr []string
 
 	for _, r := range recipients {
-		recipients_str = append(recipients_str, r.String())
+		recipientsStr = append(recipientsStr, r.String())
 	}
 
-	return strings.Join(recipients_str, ",")
+	return strings.Join(recipientsStr, ",")
 }
